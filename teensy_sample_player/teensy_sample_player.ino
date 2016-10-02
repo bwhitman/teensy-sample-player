@@ -3,6 +3,7 @@
 // brian@variogr.am
 
 #define DEAD_TIME_MS 6000
+#define FADE_MS 200
 #define LOW_MIDI_KEY 29
 #define HIGH_MIDI_KEY 89
 #define MAX_POLY 12 
@@ -11,7 +12,8 @@
 #include <SerialFlash.h>
 
 AudioPlaySerialflashRaw  sample[MAX_POLY];
-AudioConnection          *patch_cord[32];
+AudioEffectFade          fade[MAX_POLY]; // for release
+AudioConnection          *patch_cord[56];
 AudioMixer4              l_sub_mixer[3];
 AudioMixer4              r_sub_mixer[3];
 AudioMixer4              l_mixer;
@@ -46,16 +48,21 @@ void setup() {
   byte patch_counter = 0;
   for(byte sub=0;sub<3;sub++) {
     for(byte voice=0;voice<4;voice++) {
-      patch_cord[patch_counter++] = new AudioConnection(sample[(sub * 4) + voice], 0, l_sub_mixer[sub], voice);
-      patch_cord[patch_counter++] = new AudioConnection(sample[(sub * 4) + voice], 0, r_sub_mixer[sub], voice);
+      // Attach the sample player to the fade effect (for release)
+      patch_cord[patch_counter++] = new AudioConnection(sample[(sub * 4) + voice], 0, fade[(sub * 4) + voice], 0);
+      // Attach the fade effect output to the sub mixers
+      patch_cord[patch_counter++] = new AudioConnection(fade[(sub * 4) + voice], 0, l_sub_mixer[sub], voice);
+      patch_cord[patch_counter++] = new AudioConnection(fade[(sub * 4) + voice], 0, r_sub_mixer[sub], voice);
     }
+    // Attach the sub mixer to the master channel mixers
     patch_cord[patch_counter++] = new AudioConnection(l_sub_mixer[sub], 0, l_mixer, sub);
     patch_cord[patch_counter++] = new AudioConnection(r_sub_mixer[sub], 0, r_mixer, sub);
   }
+  // Attach the master channel mixers to the audio out
   patch_cord[patch_counter++] = new AudioConnection(l_mixer, 0, i2s1, 0);
   patch_cord[patch_counter++] = new AudioConnection(r_mixer, 0, i2s1, 1);
 
-  AudioMemory(50);
+  AudioMemory(62);
   sgtl5000_1.enable();
   sgtl5000_1.volume(1.0);
   delay(500);
@@ -65,10 +72,11 @@ void setup() {
 byte active[MAX_POLY];
 // Map of when each voice started playing, for note stealing
 long when[MAX_POLY];
-
+// Map of when we started the fade out so we know when to kill the note after the fade
+long faded_ms[MAX_POLY];
 
 byte get_free_voice() {
-  // Look for a free voice and return it or steal one
+  // Look for a free voice and either return it or steal one & return it 
   for(byte voice=0;voice<MAX_POLY;voice++) {
     if(active[voice] == 0) return voice;
   }
@@ -83,6 +91,8 @@ byte get_free_voice() {
   }
   sample[oldest].stop();
   active[oldest] = 0;
+  faded_ms[oldest] = 0;
+  fade[oldest].fadeIn(1); // fade in immediately just in case we stole a fading out note
   return oldest;
 }
 
@@ -107,11 +117,12 @@ void note(int key, int velocity) {
     // You need a patch on the Audio library to support half_SR playback
     // https://github.com/PaulStoffregen/Audio/pull/201
     sample[voice].play(fl[key-LOW_MIDI_KEY], true); 
-  } else { // note off
+  } else { // note off: do release
+    // we look for the note that is released, find its voice, and trigger a fadeOut
     for(byte voice=0;voice<MAX_POLY;voice++) {
       if(active[voice] == key) {
-        sample[voice].stop();
-        active[voice] = 0;
+        fade[voice].fadeOut(FADE_MS);
+        faded_ms[voice] = millis();
       }
     }
   }
@@ -121,13 +132,26 @@ void note(int key, int velocity) {
 }
 
 void kill_dead_notes() {
-  // Should not be needed, but just in case
+  AudioNoInterrupts();
+  // Kill notes deader than DEAD_TIME_MS -- should not be needed as the sample time is less than DEAD_TIME_MS, but just in case
   for(byte voice=0;voice<MAX_POLY;voice++) {
     if( (active[voice] > 0) && ( millis() - when[voice] > DEAD_TIME_MS )) {
       sample[voice].stop();
       active[voice] = 0;
     }
   }
+  // Check any fades that are done and kill them 
+  for(byte voice=0;voice<MAX_POLY;voice++) {
+    if(faded_ms[voice] > 0) {
+      if(millis() - faded_ms[voice] > FADE_MS) { // this voice has been fading longer than FADE_MS
+        sample[voice].stop();
+        active[voice] = 0;
+        fade[voice].fadeIn(1); // fade back in 
+        faded_ms[voice] = 0; // reset faded
+      }
+    }
+  }
+  AudioInterrupts();
 }
 
 void loop() {
